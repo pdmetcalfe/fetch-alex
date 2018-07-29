@@ -5,8 +5,6 @@ module Main where
 import System.Timeout
 import qualified Data.Map.Strict as M
 import Control.Monad.IO.Class
-import Control.Monad.Reader.Class
-import Control.Monad.Catch
 import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
 import Data.Maybe
@@ -25,9 +23,9 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
     
 import Text.HTML.DOM (sinkDoc) 
-import Network.HTTP.Client
-import Network.HTTP.Conduit
+import Network.HTTP.Conduit hiding (http)
 import Network.HTTP.Types
+
 import Text.XML (Document())
 import Text.XML.Cursor (fromDocument,
                         attributeIs,
@@ -38,6 +36,9 @@ import Text.XML.Cursor (fromDocument,
 import Control.Concurrent.Async (mapConcurrently_)
 import Control.Concurrent.QSem
 
+import Semaphore
+import Http
+    
 data IndexData a = IndexData {
       imgNum  :: !Int           
     , imgYear :: !String
@@ -93,13 +94,6 @@ indexData n doc = IndexData n <$> (T.unpack <$> tmp) <*> uri
                element "h2" &/ content
 
 
-withQSem :: (MonadIO m, MonadMask m,
-             MonadReader QSem m) => m c -> m c
-withQSem action = do
-  sem <- ask
-  bracket_ (liftIO $ waitQSem sem) (liftIO $ signalQSem sem) action
-
-
 namer :: BC.ByteString -> Maybe (Int -> String)
 namer = fmap printf . flip M.lookup tbl
     where
@@ -114,22 +108,22 @@ baseName imageData = imgVal imageData `getNamer` imgNum imageData
 
 imgSource = getSource . imgVal
 
-doHttp req = ask >>= http req
-
-fetchLoc :: (MonadReader Manager m, MonadResource m) =>
+fetchLoc :: (MonadReader r m, HasManager r,
+             MonadResource m) =>
             Int -> m (Maybe (IndexData URI))
 fetchLoc n = indexData n <$> do
   liftIO $ putStrLn $ "Fetching " ++ (show n)
-  response <- doHttp (alexRequest n)
+  response <- http $ alexRequest n
   responseBody response C.$$+- sinkDoc
 
 
-fetchImage :: (MonadReader Manager m, MonadResource m) =>
+fetchImage :: (MonadReader r m, HasManager r,
+               MonadResource m) =>
               IndexData URI ->
                   m (Maybe (IndexData (ImageInfo m BC.ByteString)))
 fetchImage location = do
   liftIO $ putStrLn $ "Fetching image " ++ show (imgNum location)
-  response <- doHttp (imgReq location)
+  response <- http $ imgReq location
   let ct = lookup hContentType (responseHeaders response) >>= namer
       builder name = location {
                         imgVal = ImageInfo name $ responseBody response
@@ -167,8 +161,8 @@ doFetch' getLoc getPic savePic n = maybeM action (pure ()) savePic
       action  = runMaybeT $ getLoc' n >>= getPic'
 
                
-doFetch :: (MonadReader Manager m, MonadResource m) =>
-           Int -> m ()
+doFetch :: (MonadReader r m, HasManager r,
+            MonadResource m) => Int -> m ()
 doFetch = doFetch' fetchLoc fetchImage saveImage
 
           
@@ -190,7 +184,7 @@ main = do
       fetcher = flip runReaderT
   mapConcurrently_ (relaunch .
                     fetcher semaphore .
-                    withQSem .
+                    withSemaphore .
                     liftIO . timeout 10000000 .
                     runResourceT .
                     fetcher manager .
